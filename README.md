@@ -76,11 +76,11 @@ For learning and paper trading only. Not investment advice. Simulated fills may 
 
 MIT
 
-我的GMGN UID：72957778 常用地址: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb
-有用的话请加个 star⭐吧！我会持续更新，谢谢
+我的GMGN UID：72957778 常用地址: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb 记录我的从零到一的打狗之路
+有用的话请加个 star⭐吧！我会持续更新更多链上交易，谢谢
 
-My GMGN UID: 72957778 Common address: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb
-If useful, please add a star ⭐ Go ahead! I will keep updating, thank you
+My GMGN UID: 72957778 Common address: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb Record my trading journey from zero to one
+If useful, please add a star ⭐ Go ahead! I will continue to update more on chain transactions, thank you
 
 
 MIT
