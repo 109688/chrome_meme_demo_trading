@@ -1,80 +1,86 @@
 # GMGN Paper Trade
 
-Chrome / Edge 扩展：在 [GMGN](https://gmgn.ai) 代币页用虚拟 USDT 模拟 meme 买卖，不连接钱包、不发起真实链上交易。
+Chrome / Edge extension for paper-trading memes on [GMGN](https://gmgn.ai) with virtual USDT. No wallet connection, no real on-chain transactions.
 
-**版本：** 1.4.0 · Manifest V3
+**Version:** 1.4.0 · Manifest V3
 
-## 功能
+[中文说明](./README.md)
 
-- 虚拟资金账户（默认 10,000 USDT），本地持久化
-- 市价买 / 卖（可配置滑点、手续费）
-- 自定义买入 / 卖出快捷百分比（如 `25,50,100`）
-- 限价卖单（现价 ≥ 目标价自动触发）
-- 持仓、成交、挂单列表
-- 当日盈亏与总权益展示
-- 价格来源：GMGN API → DexScreener → 页面 DOM（按优先级）
-- 可拖拽浮动面板；`Alt+P` 显示 / 隐藏
-![Uploading 8b5b8cff-ef43-44c5-82cf-a82b8b8d8d57.png…]()
-<img width="246" height="823" alt="8b5b8cff-ef43-44c5-82cf-a82b8b8d8d57" src="https://github.com/user-attachments/assets/f53fe68a-f4fa-4473-b901-d8a733050909" />
+## Features
 
+- Virtual cash account (default 10,000 USDT), persisted locally
+- Market buy / sell with configurable slippage and fees
+- Customizable buy / sell quick percentages (e.g. `25,50,100`)
+- Limit sell orders (auto-trigger when price ≥ target)
+- Positions, trade history, and open orders
+- Day P&amp;L and total equity
+- Price sources (by priority): GMGN API → DexScreener → page DOM
+- Draggable floating panel; `Alt+P` to show / hide
 
-## 支持站点与链
+## Supported sites &amp; chains
 
-| 站点 | 说明 |
-|------|------|
-| `https://gmgn.ai/*` | 主站 |
-| `https://www.gmgn.ai/*` | 主站 |
-| `https://gmgn.gracematrix.net/*` | 镜像 |
+| Site | Notes |
+|------|--------|
+| `https://gmgn.ai/*` | Main site |
+| `https://www.gmgn.ai/*` | Main site |
+| `https://gmgn.gracematrix.net/*` | Mirror |
 
-链：Solana、BSC、Robinhood、Base、ETH、Monad、Tron、Blast、Arc、Stable 等（按 GMGN 代币页 URL 识别）。
+Chains: Solana, BSC, Robinhood, Base, ETH, Monad, Tron, Blast, Arc, Stable, and more (detected from the GMGN token page URL).
 
-## 安装
+## Install
 
-1. 打开 `chrome://extensions`（Edge：`edge://extensions`）
-2. 打开右上角 **开发者模式**
-3. 点击 **加载已解压的扩展程序**
-4. 选择本仓库目录（含 `manifest.json` 与 `content.js` 的文件夹）
-5. 打开任意 GMGN **代币详情页**，硬刷新（`Ctrl+F5`）
+1. Open `chrome://extensions` (Edge: `edge://extensions`)
+2. Enable **Developer mode** (top right)
+3. Click **Load unpacked**
+4. Select this repository folder (the one with `manifest.json` and `content.js`)
+5. Open any GMGN **token detail page** and hard-refresh (`Ctrl+F5`)
 
-**成功标志：**
+**Success indicators:**
 
-- 页面顶部短暂出现橙色提示：`GMGN 模拟交易 v1.4.0 已注入`
-- 右下角出现橙色浮动按钮；点击或按 `Alt+P` 打开面板
-- 控制台有日志：`[GMGN Paper Trade] script loaded ... v1.4.0`
+- Orange banner at the top: `GMGN 模拟交易 v1.4.0 已注入`
+- Orange floating button at the bottom-right; click it or press `Alt+P` to open the panel
+- Console log: `[GMGN Paper Trade] script loaded ... v1.4.0`
 
-## 使用
+## Usage
 
-1. 进入 GMGN 的 `/{chain}/token/...` 页面，等待价格显示
-2. 输入买入金额（USDT）或点快捷 %，点击买入
-3. 卖出用持仓比例快捷键或限价卖单
-4. 设置里可调滑点 (bps)、手续费 (bps)、初始资金与买卖快捷 %
-5. 点面板 `↺` 可重置账户（清空持仓、挂单与成交）
+1. Go to a GMGN `/{chain}/token/...` page and wait for the price to load
+2. Enter a buy amount (USDT) or tap a quick %, then buy
+3. Sell with position-ratio shortcuts or place a limit sell
+4. In Settings, adjust slippage (bps), fee (bps), starting cash, and buy/sell quick %
+5. Click `↺` on the panel to reset the account (clears positions, orders, and trades)
 
-数据保存在页面 `localStorage`（键名 `gmgn_paper_trade_v1`），清除站点数据会丢失模拟账户。
+State is stored in page `localStorage` under `gmgn_paper_trade_v1`. Clearing site data will wipe the paper account.
 
-## 目录结构
+## Layout
 
 ```
 extension/
-├── manifest.json   # MV3 清单
-├── content.js      # 注入逻辑与 UI
-└── README.md
+├── manifest.json   # MV3 manifest
+├── content.js      # Injected logic & UI
+├── README.md       # Chinese
+└── README.en.md    # English
 ```
 
-## 权限说明
+## Permissions
 
-- **content_scripts**：仅在上述 GMGN 域名注入脚本
-- **host_permissions**：读取 GMGN 页面 / API，以及 `https://api.dexscreener.com/*` 拉取报价
+- **content_scripts**: Injects only on the GMGN hosts listed above
+- **host_permissions**: Access to GMGN pages / APIs, plus `https://api.dexscreener.com/*` for quotes
 
-本扩展**不会**请求钱包授权，也**不会**广播真实交易。
+This extension does **not** request wallet approval and does **not** broadcast real transactions.
 
-## 免责声明
+## Disclaimer
 
-仅供学习与模拟练习，不构成任何投资建议。模拟成交价格与真实成交可能存在偏差；请勿将本工具用于真实资金决策。
+For learning and paper trading only. Not investment advice. Simulated fills may differ from real market execution; do not use this tool for live-money decisions.
 
 ## License
 
+MIT
+
 我的GMGN UID：72957778 常用地址: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb
-有用的话请加个 star吧！我会持续更新，谢谢
+有用的话请加个 star⭐吧！我会持续更新，谢谢
+
+My GMGN UID: 72957778 Common address: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb
+If useful, please add a star ⭐ Go ahead! I will keep updating, thank you
+
 
 MIT
