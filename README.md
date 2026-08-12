@@ -14,6 +14,7 @@ Chrome / Edge 扩展：在 [GMGN](https://gmgn.ai) 代币页用虚拟 USDT 模�
 - 当日盈亏与总权益展示
 - 价格来源：GMGN API → DexScreener → 页面 DOM（按优先级）
 - 可拖拽浮动面板；`Alt+P` 显示 / 隐藏
+![Uploading image.png…]()
 
 ## 支持站点与链
 
