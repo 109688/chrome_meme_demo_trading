@@ -82,5 +82,6 @@ MIT
 My GMGN UID: 72957778 Common address: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb Record my trading journey from zero to one
 If useful, please add a star ⭐ Go ahead! I will continue to update more on chain transactions, thank you
 
+x:@liu245456 tg：@BNB9919
 
 MIT
