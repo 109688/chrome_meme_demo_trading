@@ -74,4 +74,7 @@ extension/
 
 ## License
 
+我的GMGN UID：72957778 常用地址: 5fhDbDa81fPaBN6Zt2XKm2g9sPGgKi49AwpuuVpmhREb
+有用的话请加个 star吧！我会持续更新，谢谢
+
 MIT
