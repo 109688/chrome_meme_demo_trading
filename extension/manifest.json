@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "GMGN Paper Trade",
-  "version": "1.4.0",
-  "description": "Simulate meme buy/sell with virtual USDT on GMGN (SOL / BSC / Robinhood)",
+  "version": "1.5.0",
+  "description": "Simulate meme buy/sell with virtual USDT on GMGN (SOL / BSC / Robinhood) — hardened quotes & P&L",
   "content_scripts": [
     {
       "matches": [

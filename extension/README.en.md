@@ -2,7 +2,7 @@
 
 Chrome / Edge extension for paper-trading memes on [GMGN](https://gmgn.ai) with virtual USDT. No wallet connection, no real on-chain transactions.
 
-**Version:** 1.4.0 · Manifest V3
+**Version:** 1.5.0 · Manifest V3
 
 [中文说明](./README.md)
 
@@ -14,7 +14,8 @@ Chrome / Edge extension for paper-trading memes on [GMGN](https://gmgn.ai) with 
 - Limit sell orders (auto-trigger when price ≥ target)
 - Positions, trade history, and open orders
 - Day P&amp;L and total equity
-- Price sources (by priority): GMGN API → DexScreener → page DOM
+- Price sources (by priority): GMGN API → DexScreener → page DOM; **trades only when GMGN/Dex quote is fresh**
+- Positions show cost basis and mark-to-market P&amp;L; off-page bags refresh via Dex
 - Draggable floating panel; `Alt+P` to show / hide
 
 ## Supported sites &amp; chains
@@ -37,9 +38,9 @@ Chains: Solana, BSC, Robinhood, Base, ETH, Monad, Tron, Blast, Arc, Stable, and 
 
 **Success indicators:**
 
-- Orange banner at the top: `GMGN 模拟交易 v1.4.0 已注入`
+- Orange banner at the top: `GMGN 模拟交易 v1.5.0 已注入`
 - Orange floating button at the bottom-right; click it or press `Alt+P` to open the panel
-- Console log: `[GMGN Paper Trade] script loaded ... v1.4.0`
+- Console log: `[GMGN Paper Trade] script loaded ... v1.5.0`
 
 ## Usage
 

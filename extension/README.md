@@ -2,7 +2,7 @@
 
 Chrome / Edge 扩展：在 [GMGN](https://gmgn.ai) 代币页用虚拟 USDT 模拟 meme 买卖，不连接钱包、不发起真实链上交易。
 
-**版本：** 1.4.0 · Manifest V3
+**版本：** 1.5.0 · Manifest V3
 
 [English](./README.en.md)
 
@@ -14,7 +14,8 @@ Chrome / Edge 扩展：在 [GMGN](https://gmgn.ai) 代币页用虚拟 USDT 模�
 - 限价卖单（现价 ≥ 目标价自动触发）
 - 持仓、成交、挂单列表
 - 当日盈亏与总权益展示
-- 价格来源：GMGN API → DexScreener → 页面 DOM（按优先级）
+- 价格来源：GMGN API → DexScreener → 页面 DOM（按优先级）；**仅 GMGN/Dex 且报价新鲜时才允许买卖**，避免卡顿时用错价导致浮盈虚高
+- 持仓展示成本价与按最近标记价计算的浮盈；非当前页持仓会定期用 Dex 刷新标记价
 - 可拖拽浮动面板；`Alt+P` 显示 / 隐藏
 
 ## 支持站点与链
@@ -37,17 +38,19 @@ Chrome / Edge 扩展：在 [GMGN](https://gmgn.ai) 代币页用虚拟 USDT 模�
 
 **成功标志：**
 
-- 页面顶部短暂出现橙色提示：`GMGN 模拟交易 v1.4.0 已注入`
+- 页面顶部短暂出现橙色提示：`GMGN 模拟交易 v1.5.0 已注入`
 - 右下角出现橙色浮动按钮；点击或按 `Alt+P` 打开面板
-- 控制台有日志：`[GMGN Paper Trade] script loaded ... v1.4.0`
+- 控制台有日志：`[GMGN Paper Trade] script loaded ... v1.5.0`
 
 ## 使用
 
-1. 进入 GMGN 的 `/{chain}/token/...` 页面，等待价格显示
+1. 进入 GMGN 的 `/{chain}/token/...` 页面，等待面板显示 **可交易**（报价源为 GMGN 或 Dex）
 2. 输入买入金额（USDT）或点快捷 %，点击买入
 3. 卖出用持仓比例快捷键或限价卖单
 4. 设置里可调滑点 (bps)、手续费 (bps)、初始资金与买卖快捷 %
 5. 点面板 `↺` 可重置账户（清空持仓、挂单与成交）
+
+刚切页或网络卡顿时，买卖按钮会暂时禁用并提示「等待可靠报价」——这是故意的，用来防止用过期/错误价格成交。
 
 数据保存在页面 `localStorage`（键名 `gmgn_paper_trade_v1`），清除站点数据会丢失模拟账户。
 

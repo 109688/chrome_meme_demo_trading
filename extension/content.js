@@ -2,7 +2,7 @@
   'use strict';
 
   // 最先执行：证明脚本真的注入了（不依赖后面任何逻辑）
-  console.log('[GMGN Paper Trade] script loaded on', location.href, 'v1.4.0');
+  console.log('[GMGN Paper Trade] script loaded on', location.href, 'v1.5.0');
   function showBeacon(text) {
     try {
       var old = document.getElementById('gpt-beacon');
@@ -21,10 +21,10 @@
       console.error('[GMGN Paper Trade] beacon failed', e);
     }
   }
-  showBeacon('GMGN 模拟交易 v1.4.0 已注入');
+  showBeacon('GMGN 模拟交易 v1.5.0 已注入');
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () {
-      showBeacon('GMGN 模拟交易 v1.4.0 已注入');
+      showBeacon('GMGN 模拟交易 v1.5.0 已注入');
     });
   }
 
@@ -33,6 +33,13 @@
   const FAB_ID = 'gmgn-paper-trade-fab';
   const DEFAULT_START_CASH = 10000;
   const PRICE_POLL_MS = 400;
+  /** Buy/sell only when quote is from GMGN/Dex and younger than this */
+  const QUOTE_MAX_AGE_MS = 8000;
+  /** After SPA route change, ignore DOM prices (prevents previous-token bleed) */
+  const DOM_ROUTE_GRACE_MS = 1800;
+  /** Reject DOM quotes that jump more than this vs current mark */
+  const DOM_MAX_JUMP = 5;
+  const HELD_QUOTE_REFRESH_MS = 15000;
   const LOG = (...args) => console.log('[GMGN Paper Trade]', ...args);
   const SUPPORTED_CHAINS = new Set([
     'sol', 'bsc', 'robinhood', 'base', 'eth', 'monad', 'tron', 'blast', 'arc', 'stable',
@@ -65,8 +72,11 @@
     price: null,
     mcap: null,
     source: '',
+    updatedAt: 0,
+    routeGen: 0,
   };
   let lastRoute = '';
+  let routeChangedAt = 0;
   let dragOffset = { x: 0, y: 0 };
   let dragging = false;
   let bootTries = 0;
@@ -76,7 +86,10 @@
   let dexFetching = false;
   let lastGmgnFetchAt = 0;
   let gmgnFetching = false;
+  let lastHeldRefreshAt = 0;
+  let heldRefreshing = false;
   const SOURCE_RANK = { 'gmgn-api': 3, dex: 2, dom: 1, '': 0 };
+  const TRUSTED_SOURCES = new Set(['gmgn-api', 'dex']);
 
   try {
     state = loadState();
@@ -94,7 +107,7 @@
     installSpaHooks();
     scheduleBoot();
     window.addEventListener('keydown', onHotkey, true);
-    showBeacon('GMGN 模拟交易已就绪 v1.4.0');
+    showBeacon('GMGN 模拟交易已就绪 v1.5.0');
   } catch (err) {
     console.error('[GMGN Paper Trade] fatal init error', err);
     showBeacon('GMGN 模拟脚本出错: ' + (err && err.message ? err.message : err));
@@ -431,40 +444,104 @@
         const r = deepFindPrice(item, depth + 1, preferAddr);
         if (!r) continue;
         if (preferAddr && r.address && addrEquals(r.address, preferAddr)) return r;
-        if (!best) best = r;
+        if (!preferAddr && !best) best = r;
       }
-      return best;
+      // When a preferred address is set, never return an unmatched first hit
+      return preferAddr ? null : best;
     }
     if (typeof obj !== 'object') return null;
 
     const direct = extractFromTokenObj(obj);
-    if (direct && preferAddr && direct.address && addrEquals(direct.address, preferAddr)) return direct;
+    if (direct) {
+      if (preferAddr) {
+        if (direct.address && addrEquals(direct.address, preferAddr)) return direct;
+      } else {
+        // keep scanning for a better match only when no preferAddr
+      }
+    }
 
-    let best = direct;
+    let best = preferAddr ? null : direct;
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (v && typeof v === 'object') {
         const r = deepFindPrice(v, depth + 1, preferAddr);
         if (!r) continue;
         if (preferAddr && r.address && addrEquals(r.address, preferAddr)) return r;
-        if (!best) best = r;
+        if (!preferAddr && !best) best = r;
       }
     }
+    if (preferAddr) return null;
+    if (!best && direct && !preferAddr) best = direct;
     return best;
+  }
+
+  function isTrustedSource(src) {
+    return TRUSTED_SOURCES.has(src || '');
+  }
+
+  function quoteAgeMs() {
+    if (!live.updatedAt) return Infinity;
+    return Date.now() - live.updatedAt;
+  }
+
+  function routeGraceActive() {
+    return routeChangedAt > 0 && Date.now() - routeChangedAt < DOM_ROUTE_GRACE_MS;
+  }
+
+  function rememberMarkPrice(price) {
+    if (!(price > 0) || !live.chain || !live.address) return;
+    const key = posKey(live.chain, live.address);
+    const pos = state.positions[key];
+    if (!pos) return;
+    pos.lastPrice = price;
+    pos.lastPriceAt = Date.now();
+  }
+
+  function markPriceForPos(key, pos) {
+    if (isCurrentPos(key) && live.price != null && live.price > 0) return live.price;
+    if (pos && pos.lastPrice != null && pos.lastPrice > 0) return pos.lastPrice;
+    return pos ? pos.avgCostUsdt : null;
   }
 
   function applyLiveQuote(found, source) {
     if (!found || found.price == null || !(found.price > 0)) return false;
     const route = parseRoute(location.pathname);
     const want = route.address || live.address;
+
+    // Never attach a quote from another token
     if (want && found.address && !addrEquals(found.address, want)) return false;
+
+    // Trusted API/Dex must carry a matching address when we know the token
+    if (want && isTrustedSource(source) && !found.address) return false;
+
+    // DOM during SPA transition often still shows the previous token
+    if (source === 'dom' && want && routeGraceActive()) {
+      if (found.symbol && (!live.symbol || live.symbol === '—')) live.symbol = found.symbol;
+      return false;
+    }
+
+    // DOM without verified address: display-only gap fill after grace; never overwrite trusted
+    if (want && !found.address) {
+      if (source !== 'dom') return false;
+      if (live.price != null && isTrustedSource(live.source)) return false;
+      if (routeGraceActive()) return false;
+    }
+
+    // Reject absurd DOM jumps (often mis-bound mcap / wrong node)
+    if (source === 'dom' && live.price != null && live.price > 0) {
+      const ratio = found.price / live.price;
+      if (ratio > DOM_MAX_JUMP || ratio < 1 / DOM_MAX_JUMP) return false;
+    }
+
+    // If labeled "price" looks like a market-cap scale vs known mcap, reject
+    if (found.mcap != null && found.mcap > 0 && found.price > 0) {
+      if (found.price > found.mcap * 0.5 && found.mcap > 1000) return false;
+    }
 
     const incoming = SOURCE_RANK[source] || 0;
     const current = SOURCE_RANK[live.source] || 0;
-    // Lower-ranked source cannot overwrite a fresher higher-ranked quote
-    // unless we have no price yet.
+    // Lower-ranked source cannot overwrite a higher-ranked quote unless empty
     if (live.price != null && incoming < current) {
-      // Still allow mcap fill-in if missing
       if (live.mcap == null && found.mcap != null && found.mcap > 0 && incoming >= 1) {
         live.mcap = found.mcap;
         scheduleRender();
@@ -472,11 +549,14 @@
       return false;
     }
 
+    // Same or higher rank: still reject stale DOM overwriting a fresh trusted quote of equal... DOM is always lower
     live.price = found.price;
     if (found.mcap != null && found.mcap > 0) live.mcap = found.mcap;
     if (found.symbol) live.symbol = found.symbol;
     if (found.address && !live.address) live.address = found.address;
     live.source = source || live.source || '';
+    live.updatedAt = Date.now();
+    rememberMarkPrice(found.price);
     checkLimitOrders();
     scheduleRender();
     return true;
@@ -485,8 +565,11 @@
   function ingestJsonPayload(data) {
     try {
       const route = parseRoute(location.pathname);
-      const found = deepFindPrice(data, 0, route.address || live.address);
-      if (!found) return;
+      const want = route.address || live.address;
+      // Require address match — never promote anonymous first-price hits to gmgn-api
+      if (!want) return;
+      const found = deepFindPrice(data, 0, want);
+      if (!found || !found.address || !addrEquals(found.address, want)) return;
       applyLiveQuote(found, 'gmgn-api');
     } catch (_) {
       /* ignore */
@@ -573,7 +656,7 @@
             return base && addrEquals(base, address);
           })
           .sort((a, b) => (Number(b.liquidity && b.liquidity.usd) || 0) - (Number(a.liquidity && a.liquidity.usd) || 0));
-        const pick = matched[0] || pairs[0];
+        const pick = matched[0];
         if (!pick) return;
         const price = Number(pick.priceUsd);
         const mcap = Number(pick.marketCap || pick.fdv);
@@ -593,7 +676,54 @@
       });
   }
 
-  function findLabeledValue(labels) {
+  /** Mark-to-market off-page holdings via DexScreener (avoids equity stuck at cost) */
+  function refreshHeldQuotes(force) {
+    const now = Date.now();
+    if (!force && (heldRefreshing || now - lastHeldRefreshAt < HELD_QUOTE_REFRESH_MS)) return;
+    const entries = Object.entries(state.positions || {});
+    if (!entries.length) return;
+    lastHeldRefreshAt = now;
+    heldRefreshing = true;
+
+    const jobs = entries
+      .filter(([key, pos]) => pos && pos.amount > 0 && pos.address && !isCurrentPos(key))
+      .slice(0, 8)
+      .map(([key, pos]) => {
+        const url = 'https://api.dexscreener.com/latest/dex/tokens/' + encodeURIComponent(pos.address);
+        return fetch(url)
+          .then((r) => r.json())
+          .then((data) => {
+            const pairs = (data && data.pairs) || [];
+            const matched = pairs
+              .filter((p) => {
+                const base = p.baseToken && p.baseToken.address;
+                return base && addrEquals(base, pos.address);
+              })
+              .sort(
+                (a, b) =>
+                  (Number(b.liquidity && b.liquidity.usd) || 0) - (Number(a.liquidity && a.liquidity.usd) || 0)
+              );
+            const pick = matched[0];
+            if (!pick) return;
+            const price = Number(pick.priceUsd);
+            if (!(price > 0)) return;
+            const cur = state.positions[key];
+            if (!cur) return;
+            cur.lastPrice = price;
+            cur.lastPriceAt = Date.now();
+            if (pick.baseToken && pick.baseToken.symbol) cur.symbol = pick.baseToken.symbol;
+          })
+          .catch(() => {});
+      });
+
+    Promise.all(jobs).finally(() => {
+      heldRefreshing = false;
+      scheduleRender();
+    });
+  }
+
+  function findLabeledValue(labels, opts) {
+    const maxVal = (opts && opts.max) || Infinity;
     if (!document.body) return null;
     const all = document.body.querySelectorAll('div, span, p, dt, dd, th, td, label');
     for (let i = 0; i < all.length && i < 2500; i++) {
@@ -609,11 +739,11 @@
           .filter((x) => x && x !== t && x.length < 40);
         for (const x of texts) {
           const n = parseMoney(x);
-          if (n != null && n > 0) return n;
+          if (n != null && n > 0 && n < maxVal) return n;
         }
         const pt = (parent.textContent || '').replace(t, ' ').trim();
         const n = parseMoney(pt.split(/\s+/).find((w) => /[\d$]/.test(w)) || pt);
-        if (n != null && n > 0) return n;
+        if (n != null && n > 0 && n < maxVal) return n;
       }
     }
     return null;
@@ -634,8 +764,9 @@
       if (tm) live.symbol = tm[1];
     }
 
-    // DOM is lowest priority — only fill gaps / never clobber gmgn-api or dex
-    const labeledPrice = findLabeledValue(['价格', 'Price', 'price', '单价']);
+    // DOM is lowest priority — never stamp route address onto scraped numbers
+    // (that caused previous-token price bleed on SPA navigations).
+    const labeledPrice = findLabeledValue(['价格', 'Price', 'price', '单价'], { max: 1e6 });
     const labeledMcap = findLabeledValue(['市值', 'Market Cap', 'MarketCap', 'Mkt Cap', 'MC']);
 
     if (labeledPrice != null || labeledMcap != null) {
@@ -644,12 +775,12 @@
           price: labeledPrice,
           mcap: labeledMcap,
           symbol: live.symbol !== '—' ? live.symbol : null,
-          address: live.address,
+          address: null,
         },
         'dom'
       );
-    } else if (live.price == null && document.body) {
-      // Only when completely empty: look for GMGN subscript tiny prices near header
+    } else if (live.price == null && !routeGraceActive() && document.body) {
+      // Only when completely empty and past SPA grace: look for tiny prices near header
       const header = document.querySelector('h1') && document.querySelector('h1').parentElement;
       const scope = header || document.body;
       const nodes = scope.querySelectorAll('span, div, b, strong');
@@ -659,7 +790,7 @@
         if (!/^\$/.test(txt) && !/^0\.0[₀₁₂₃₄₅₆₇₈₉]/.test(txt)) continue;
         const n = parseMoney(txt);
         if (n != null && n > 0 && n < 100) {
-          applyLiveQuote({ price: n, mcap: null, address: live.address }, 'dom');
+          applyLiveQuote({ price: n, mcap: null, address: null }, 'dom');
           break;
         }
       }
@@ -669,6 +800,7 @@
       fetchGmgnTokenInfo(false);
       fetchDexScreenerQuote(false);
     }
+    refreshHeldQuotes(false);
     scheduleRender();
   }
 
@@ -802,9 +934,17 @@
     live.mcap = null;
     live.symbol = '—';
     live.source = '';
+    live.updatedAt = 0;
+    live.routeGen = (live.routeGen || 0) + 1;
+    routeChangedAt = Date.now();
     lastDexFetchAt = 0;
     lastGmgnFetchAt = 0;
     LOG('route', route);
+    // Prefer trusted APIs immediately; DOM scrape waits for grace inside applyLiveQuote
+    if (route.address) {
+      fetchGmgnTokenInfo(true);
+      fetchDexScreenerQuote(true);
+    }
     scrapeDomPrice();
     scheduleRender(true);
   }
@@ -816,8 +956,8 @@
   function calcPositionsValue() {
     let total = 0;
     for (const [key, pos] of Object.entries(state.positions)) {
-      const px = isCurrentPos(key) && live.price != null ? live.price : pos.avgCostUsdt;
-      total += pos.amount * px;
+      const px = markPriceForPos(key, pos);
+      if (px != null && px > 0) total += pos.amount * px;
     }
     return total;
   }
@@ -846,15 +986,37 @@
     return (notional * bps) / 10000;
   }
 
+  /** Refuse trade on stale/DOM/unverified quotes — root cause of fake multi-x P&L */
+  function assertTradeableQuote() {
+    if (!live.chain || !live.address) return { ok: false, error: '请打开 token 详情页' };
+    if (live.price == null || live.price <= 0) {
+      fetchGmgnTokenInfo(true);
+      fetchDexScreenerQuote(true);
+      return { ok: false, error: '暂无有效价格，稍候再试' };
+    }
+    if (!isTrustedSource(live.source)) {
+      fetchGmgnTokenInfo(true);
+      fetchDexScreenerQuote(true);
+      return { ok: false, error: '报价未就绪（需 GMGN/Dex），请稍候' };
+    }
+    if (quoteAgeMs() > QUOTE_MAX_AGE_MS) {
+      fetchGmgnTokenInfo(true);
+      fetchDexScreenerQuote(true);
+      return { ok: false, error: '报价过期，正在刷新…' };
+    }
+    return { ok: true };
+  }
+
   function buy(usdtAmount) {
     ensureDayAnchor();
     const amountIn = Number(usdtAmount);
     if (!Number.isFinite(amountIn) || amountIn <= 0) return { ok: false, error: '金额无效' };
-    if (!live.chain || !live.address) return { ok: false, error: '请打开 token 详情页' };
-    if (live.price == null || live.price <= 0) return { ok: false, error: '暂无有效价格，稍候再试' };
+    const q = assertTradeableQuote();
+    if (!q.ok) return q;
     if (amountIn > state.cashUsdt + 1e-9) return { ok: false, error: '余额不足' };
 
-    const execPrice = applySlippage(live.price, 'buy');
+    const midPrice = live.price;
+    const execPrice = applySlippage(midPrice, 'buy');
     const fee = applyFee(amountIn);
     const net = amountIn - fee;
     if (net <= 0) return { ok: false, error: '金额过小' };
@@ -866,6 +1028,8 @@
       prev.avgCostUsdt = (prev.amount * prev.avgCostUsdt + net) / newAmt;
       prev.amount = newAmt;
       prev.symbol = live.symbol || prev.symbol;
+      prev.lastPrice = midPrice;
+      prev.lastPriceAt = Date.now();
     } else {
       state.positions[key] = {
         chain: live.chain,
@@ -873,6 +1037,8 @@
         symbol: live.symbol || shortAddr(live.address),
         amount: tokenAmount,
         avgCostUsdt: execPrice,
+        lastPrice: midPrice,
+        lastPriceAt: Date.now(),
         openedAt: Date.now(),
       };
     }
@@ -883,13 +1049,15 @@
       address: live.address,
       symbol: live.symbol || shortAddr(live.address),
       price: execPrice,
+      midPrice,
       amount: tokenAmount,
       notional: amountIn,
       fee,
       realizedPnl: 0,
+      quoteSource: live.source,
     });
     saveState();
-    return { ok: true };
+    return { ok: true, execPrice, midPrice };
   }
 
   function sell(ratio) {
@@ -906,14 +1074,19 @@
     ensureDayAnchor();
     const amount = Number(tokenAmount);
     if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: '数量无效' };
-    if (live.price == null || live.price <= 0) return { ok: false, error: '暂无有效价格，稍候再试' };
+    const q = assertTradeableQuote();
+    if (!q.ok) return q;
+    if (!addrEquals(address, live.address) || chain !== live.chain) {
+      return { ok: false, error: '请打开该代币页后再卖出' };
+    }
 
     const key = posKey(chain, address);
     const pos = state.positions[key];
     if (!pos || pos.amount <= 0) return { ok: false, error: '无持仓' };
 
     const sellAmt = Math.min(amount, pos.amount);
-    const execPrice = applySlippage(live.price, 'sell');
+    const midPrice = live.price;
+    const execPrice = applySlippage(midPrice, 'sell');
     const gross = sellAmt * execPrice;
     const fee = applyFee(gross);
     const proceeds = gross - fee;
@@ -921,6 +1094,10 @@
 
     pos.amount -= sellAmt;
     if (pos.amount <= 1e-12) delete state.positions[key];
+    else {
+      pos.lastPrice = midPrice;
+      pos.lastPriceAt = Date.now();
+    }
 
     state.cashUsdt += proceeds;
     state.realizedPnl = (state.realizedPnl || 0) + realized;
@@ -930,14 +1107,16 @@
       address,
       symbol: (pos && pos.symbol) || live.symbol,
       price: execPrice,
+      midPrice,
       amount: sellAmt,
       notional: proceeds,
       fee,
       realizedPnl: realized,
       note: (opts && opts.note) || '',
+      quoteSource: live.source,
     });
     saveState();
-    return { ok: true, realized, sold: sellAmt };
+    return { ok: true, realized, sold: sellAmt, execPrice };
   }
 
   function placeLimitSell(targetPrice, ratioPct) {
@@ -1406,7 +1585,11 @@
     if (act === 'buy') {
       const input = document.querySelector(`#${PANEL_ID} [data-field="buyAmount"]`);
       const res = buy(input ? Number(input.value) : 0);
-      msg(res.ok ? `买入成功 @ ${fmt(live.price, 8)}` : res.error);
+      msg(
+        res.ok
+          ? `买入成功 @ $${fmt(res.execPrice, 8)}（中间价 $${fmt(res.midPrice, 8)}）`
+          : res.error
+      );
       scheduleRender(true);
       return;
     }
@@ -1471,10 +1654,12 @@
     const equity = calcEquity();
     const dayPnl = equity - (state.dayStartEquity || equity);
     const pos = currentPosition();
-    const posValue = pos && live.price != null ? pos.amount * live.price : null;
+    const markPx = pos ? markPriceForPos(posKey(live.chain, live.address), pos) : null;
+    const posValue = pos && markPx != null ? pos.amount * markPx : null;
     const posCost = pos ? pos.amount * pos.avgCostUsdt : null;
     const upnl = posValue != null && posCost != null ? posValue - posCost : null;
     const upnlPct = posCost ? upnl / posCost : null;
+    const quoteOk = isTrustedSource(live.source) && live.price != null && quoteAgeMs() <= QUOTE_MAX_AGE_MS;
 
     const set = (key, text, cls) => {
       const el = body.querySelector(`[data-live="${key}"]`);
@@ -1492,13 +1677,40 @@
     set('price', live.price != null ? '$' + fmt(live.price, 8) : '读取中…');
     set('mcap', live.mcap != null ? '$' + fmt(live.mcap) : '—');
     set('posAmt', pos ? fmt(pos.amount, 4) : '0');
+    set('avgCost', pos ? '$' + fmt(pos.avgCostUsdt, 8) : '—');
     set('upnl', upnl == null ? '—' : (upnl >= 0 ? '+' : '') + fmt(upnl), 'gpt-live ' + pnlClass(upnl));
     set('upnlPct', upnlPct == null ? '—' : fmtPct(upnlPct), 'gpt-pnl-pct ' + pnlClass(upnlPct));
     const srcMap = { 'gmgn-api': 'GMGN', dex: 'Dex', dom: '页面' };
-    set('src', live.source ? '报价源: ' + (srcMap[live.source] || live.source) : '');
+    const age = live.updatedAt ? Math.round(quoteAgeMs() / 100) / 10 + 's' : '—';
+    const ready = quoteOk ? '可交易' : '等待可靠报价';
+    set(
+      'src',
+      live.source
+        ? `报价源: ${srcMap[live.source] || live.source} · ${age} · ${ready}`
+        : '报价源: …'
+    );
 
     const openN = (state.orders || []).filter((o) => o.status === 'open').length;
     set('openOrders', String(openN));
+
+    // Keep trade controls in sync without full re-render
+    body.querySelectorAll('[data-act="buy"]').forEach((el) => {
+      el.disabled = !quoteOk;
+    });
+    body.querySelectorAll('[data-act="sell-pct"]').forEach((el) => {
+      el.disabled = !(quoteOk && pos);
+    });
+    body.querySelectorAll('[data-act="limit-sell"]').forEach((el) => {
+      el.disabled = !(quoteOk && pos);
+    });
+    const msgEl = body.querySelector('.gpt-msg');
+    if (msgEl && !quoteOk) {
+      if (!msgEl.textContent || msgEl.textContent.indexOf('等待') === 0 || msgEl.textContent === '') {
+        msgEl.textContent = '等待 GMGN/Dex 可靠报价后再交易…';
+      }
+    } else if (msgEl && quoteOk && msgEl.textContent.indexOf('等待 GMGN/Dex') === 0) {
+      msgEl.textContent = '';
+    }
   }
 
   function scheduleRender(forceFull) {
@@ -1561,29 +1773,32 @@
     const equity = calcEquity();
     const dayPnl = equity - (state.dayStartEquity || equity);
     const pos = currentPosition();
-    const posValue = pos && live.price != null ? pos.amount * live.price : null;
+    const markPx = pos ? markPriceForPos(posKey(live.chain, live.address), pos) : null;
+    const posValue = pos && markPx != null ? pos.amount * markPx : null;
     const posCost = pos ? pos.amount * pos.avgCostUsdt : null;
     const upnl = posValue != null && posCost != null ? posValue - posCost : null;
     const upnlPct = posCost ? upnl / posCost : null;
+    const quoteOk = isTrustedSource(live.source) && live.price != null && quoteAgeMs() <= QUOTE_MAX_AGE_MS;
 
     const buyPcts = normalizePctList(state.settings.buyPcts);
     const sellPcts = normalizePctList(state.settings.sellPcts);
 
     const posRows = Object.entries(state.positions)
       .map(([key, p]) => {
-        const px = isCurrentPos(key) && live.price != null ? live.price : p.avgCostUsdt;
-        const val = p.amount * px;
+        const px = markPriceForPos(key, p);
+        const val = px != null ? p.amount * px : p.amount * p.avgCostUsdt;
         const cost = p.amount * p.avgCostUsdt;
         const pnl = val - cost;
         const pct = cost ? pnl / cost : null;
+        const stale = !isCurrentPos(key) && (!p.lastPriceAt || Date.now() - p.lastPriceAt > 60000);
         return `<div class="gpt-item" data-pos-key="${escapeAttr(key)}">
           <div>
             <div><strong>${escapeHtml(p.symbol)}</strong> <span class="gpt-chain">${escapeHtml(p.chain)}</span></div>
-            <div class="gpt-muted">${shortAddr(p.address)}</div>
+            <div class="gpt-muted">${shortAddr(p.address)}${stale ? ' · 价待刷新' : ''}</div>
           </div>
           <div style="text-align:right">
             <div class="${pnlClass(pnl)}">${fmt(val)} <span class="gpt-pnl-pct">${pct == null ? '' : fmtPct(pct)}</span></div>
-            <div class="gpt-muted">${fmt(p.amount, 4)} tok</div>
+            <div class="gpt-muted">${fmt(p.amount, 4)} tok · 成本 $${fmt(p.avgCostUsdt, 8)}</div>
           </div>
         </div>`;
       })
@@ -1632,7 +1847,7 @@
     const sellBtns = sellPcts
       .map((p) => {
         const label = p >= 100 ? '清仓' : '卖' + p + '%';
-        return `<button type="button" class="gpt-btn gpt-sell" data-act="sell-pct" data-pct="${p / 100}" ${pos ? '' : 'disabled'}>${label}</button>`;
+        return `<button type="button" class="gpt-btn gpt-sell" data-act="sell-pct" data-pct="${p / 100}" ${pos && quoteOk ? '' : 'disabled'}>${label}</button>`;
       })
       .join('');
 
@@ -1640,7 +1855,12 @@
     const chev = (open) => (open ? '▾' : '▸');
     const posCount = Object.keys(state.positions).length;
     const srcMap = { 'gmgn-api': 'GMGN', dex: 'Dex', dom: '页面' };
-    const srcLabel = live.source ? srcMap[live.source] || live.source : '…';
+    const age = live.updatedAt ? Math.round(quoteAgeMs() / 100) / 10 + 's' : '—';
+    const ready = quoteOk ? '可交易' : '等待可靠报价';
+    const srcLabel = live.source
+      ? `${srcMap[live.source] || live.source} · ${age} · ${ready}`
+      : '…';
+    const tradeDisabled = onToken && !quoteOk ? 'disabled' : '';
     const defaultLimitPrice =
       fieldSnap.limitPrice ||
       (live.price != null ? String(+(live.price * 1.1).toPrecision(6)) : '');
@@ -1667,6 +1887,7 @@
         <div class="gpt-row"><span class="gpt-muted">价格</span><span data-live="price">${live.price != null ? '$' + fmt(live.price, 8) : '读取中…'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">市值</span><span data-live="mcap">${live.mcap != null ? '$' + fmt(live.mcap) : '—'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">持仓</span><span data-live="posAmt">${pos ? fmt(pos.amount, 4) : '0'}</span></div>
+        <div class="gpt-row"><span class="gpt-muted">成本价</span><span data-live="avgCost">${pos ? '$' + fmt(pos.avgCostUsdt, 8) : '—'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">浮盈</span><span data-live="upnl" class="${pnlClass(upnl)}">${upnl == null ? '—' : (upnl >= 0 ? '+' : '') + fmt(upnl)}</span></div>
         <div class="gpt-row"><span class="gpt-muted">盈亏%</span><span data-live="upnlPct" class="gpt-pnl-pct ${pnlClass(upnlPct)}">${upnlPct == null ? '—' : fmtPct(upnlPct)}</span></div>
         <div class="gpt-src" data-live="src">报价源: ${escapeHtml(srcLabel)}</div>
@@ -1679,7 +1900,7 @@
         <input class="gpt-input" data-field="buyAmount" type="number" min="0" step="any" placeholder="买入 USDT 金额" />
         <div class="gpt-btns" style="grid-template-columns: repeat(${Math.min(buyPcts.length + 1, 4)}, 1fr)">
           ${buyBtns}
-          <button type="button" class="gpt-btn gpt-buy" data-act="buy">买</button>
+          <button type="button" class="gpt-btn gpt-buy" data-act="buy" ${tradeDisabled}>买</button>
         </div>
         <div class="gpt-actions" style="grid-template-columns: repeat(${Math.min(sellPcts.length, 4)}, 1fr)">
           ${sellBtns}
@@ -1693,8 +1914,8 @@
             <input class="gpt-input" data-field="limitRatio" type="number" min="1" max="100" step="1" value="${escapeAttr(defaultLimitRatio)}" />
           </label>
         </div>
-        <button type="button" class="gpt-btn gpt-sell" data-act="limit-sell" style="width:100%;margin-top:4px" ${pos ? '' : 'disabled'}>挂限价卖单</button>
-        <div class="gpt-msg"></div>
+        <button type="button" class="gpt-btn gpt-sell" data-act="limit-sell" style="width:100%;margin-top:4px" ${pos && quoteOk ? '' : 'disabled'}>挂限价卖单</button>
+        <div class="gpt-msg">${quoteOk ? '' : '等待 GMGN/Dex 可靠报价后再交易…'}</div>
       </div>`
           : `<div class="gpt-card gpt-muted">打开 token 页可买卖 · Alt+P</div>`
       }
@@ -1742,7 +1963,7 @@
           <div class="gpt-msg-settings gpt-muted" style="margin-top:6px">快捷%用逗号分隔，如 10,25,50,100</div>
         </div>
       </div>
-      <div class="gpt-watermark">PAPER · Alt+P · v1.4.0</div>
+      <div class="gpt-watermark">PAPER · Alt+P · v1.5.0</div>
     `;
 
     restoreFields(body, fieldSnap);
