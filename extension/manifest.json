@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "GMGN Paper Trade",
-  "version": "1.5.0",
-  "description": "Simulate meme buy/sell with virtual USDT on GMGN (SOL / BSC / Robinhood) — hardened quotes & P&L",
+  "version": "1.7.6",
+  "description": "GMGN paper trade — page DOM + WS realtime mark, Dex fallback only",
   "content_scripts": [
     {
       "matches": [
@@ -10,8 +10,20 @@
         "https://www.gmgn.ai/*",
         "https://gmgn.gracematrix.net/*"
       ],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://www.gmgn.ai/*",
+        "https://gmgn.gracematrix.net/*"
+      ],
       "js": ["content.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": false
     }
   ],
   "host_permissions": [

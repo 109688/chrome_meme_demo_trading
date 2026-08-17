@@ -2,7 +2,7 @@
   'use strict';
 
   // 最先执行：证明脚本真的注入了（不依赖后面任何逻辑）
-  console.log('[GMGN Paper Trade] script loaded on', location.href, 'v1.5.0');
+  console.log('[GMGN Paper Trade] script loaded on', location.href, 'v1.7.6');
   function showBeacon(text) {
     try {
       var old = document.getElementById('gpt-beacon');
@@ -21,10 +21,10 @@
       console.error('[GMGN Paper Trade] beacon failed', e);
     }
   }
-  showBeacon('GMGN 模拟交易 v1.5.0 已注入');
+  showBeacon('GMGN 模拟交易 v1.7.6 已注入');
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () {
-      showBeacon('GMGN 模拟交易 v1.5.0 已注入');
+      showBeacon('GMGN 模拟交易 v1.7.6 已注入');
     });
   }
 
@@ -32,14 +32,11 @@
   const PANEL_ID = 'gmgn-paper-trade-root';
   const FAB_ID = 'gmgn-paper-trade-fab';
   const DEFAULT_START_CASH = 10000;
-  const PRICE_POLL_MS = 400;
-  /** Buy/sell only when quote is from GMGN/Dex and younger than this */
-  const QUOTE_MAX_AGE_MS = 8000;
-  /** After SPA route change, ignore DOM prices (prevents previous-token bleed) */
-  const DOM_ROUTE_GRACE_MS = 1800;
-  /** Reject DOM quotes that jump more than this vs current mark */
-  const DOM_MAX_JUMP = 5;
-  const HELD_QUOTE_REFRESH_MS = 15000;
+  const PRICE_POLL_MS = 200;
+  const DOM_ROUTE_GRACE_MS = 500;
+  const HELD_QUOTE_REFRESH_MS = 12000;
+  const PAINT_MIN_MS = 80;
+  const MIN_PAGE_MOVE = 1e-12; // accept any real change from locked page node
   const LOG = (...args) => console.log('[GMGN Paper Trade]', ...args);
   const SUPPORTED_CHAINS = new Set([
     'sol', 'bsc', 'robinhood', 'base', 'eth', 'monad', 'tron', 'blast', 'arc', 'stable',
@@ -72,6 +69,7 @@
     price: null,
     mcap: null,
     source: '',
+    markFrom: '',
     updatedAt: 0,
     routeGen: 0,
   };
@@ -82,14 +80,17 @@
   let bootTries = 0;
   // Must be declared before any early scheduleRender() call (TDZ fix)
   let renderQueued = false;
+  let renderForceFull = false;
   let lastDexFetchAt = 0;
   let dexFetching = false;
   let lastGmgnFetchAt = 0;
   let gmgnFetching = false;
   let lastHeldRefreshAt = 0;
   let heldRefreshing = false;
-  const SOURCE_RANK = { 'gmgn-api': 3, dex: 2, dom: 1, '': 0 };
-  const TRUSTED_SOURCES = new Set(['gmgn-api', 'dex']);
+  let lastPaintAt = 0;
+  let paintQueued = false;
+  const PAGE_SOURCES = new Set(['dom-tick', 'dom', 'page', 'page-json', 'gmgn-api']);
+  const TRUSTED_SOURCES = new Set(['dom-tick', 'dom', 'page', 'page-json', 'gmgn-api', 'dex']);
 
   try {
     state = loadState();
@@ -103,11 +104,12 @@
     if (!Array.isArray(state.settings.sellPcts) || !state.settings.sellPcts.length) {
       state.settings.sellPcts = [25, 50, 100];
     }
+    migratePositionsCost();
     installPageHooks();
     installSpaHooks();
     scheduleBoot();
     window.addEventListener('keydown', onHotkey, true);
-    showBeacon('GMGN 模拟交易已就绪 v1.5.0');
+    showBeacon('GMGN 模拟交易已就绪 v1.7.6');
   } catch (err) {
     console.error('[GMGN Paper Trade] fatal init error', err);
     showBeacon('GMGN 模拟脚本出错: ' + (err && err.message ? err.message : err));
@@ -490,89 +492,167 @@
 
   function rememberMarkPrice(price) {
     if (!(price > 0) || !live.chain || !live.address) return;
-    const key = posKey(live.chain, live.address);
-    const pos = state.positions[key];
-    if (!pos) return;
-    pos.lastPrice = price;
-    pos.lastPriceAt = Date.now();
+    for (const pos of Object.values(state.positions || {})) {
+      if (!pos || !(pos.amount > 0)) continue;
+      if (pos.chain !== live.chain || !addrEquals(pos.address, live.address)) continue;
+      pos.lastPrice = price;
+      pos.lastPriceAt = Date.now();
+    }
+  }
+
+  function isLiveTokenPos(pos) {
+    return !!(
+      pos &&
+      live.chain &&
+      live.address &&
+      pos.chain === live.chain &&
+      addrEquals(pos.address, live.address)
+    );
   }
 
   function markPriceForPos(key, pos) {
-    if (isCurrentPos(key) && live.price != null && live.price > 0) return live.price;
+    if (isLiveTokenPos(pos) && live.price != null && live.price > 0) return live.price;
+    if (key && isCurrentPos(key) && live.price != null && live.price > 0) return live.price;
     if (pos && pos.lastPrice != null && pos.lastPrice > 0) return pos.lastPrice;
     return pos ? pos.avgCostUsdt : null;
   }
 
+  function ensurePosCost(pos) {
+    if (!pos || !(pos.amount > 0)) return;
+    if (!(pos.costUsdt > 0) && pos.avgCostUsdt > 0) {
+      pos.costUsdt = pos.amount * pos.avgCostUsdt;
+    }
+  }
+
+  function migratePositionsCost() {
+    let changed = false;
+    for (const pos of Object.values(state.positions || {})) {
+      if (!pos || !(pos.amount > 0)) continue;
+      if (!(pos.costUsdt > 0) && pos.avgCostUsdt > 0) {
+        pos.costUsdt = pos.amount * pos.avgCostUsdt;
+        changed = true;
+      }
+      if (pos.costUsdt > 0 && pos.amount > 0) {
+        pos.avgCostUsdt = pos.costUsdt / pos.amount;
+      }
+    }
+    if (changed) saveState();
+  }
+
+  function posCostUsdt(pos) {
+    ensurePosCost(pos);
+    return pos && pos.costUsdt > 0 ? pos.costUsdt : null;
+  }
+
+  function posUnrealizedPnl(key, pos) {
+    if (!pos || !(pos.amount > 0)) return null;
+    const px = markPriceForPos(key, pos);
+    const cost = posCostUsdt(pos);
+    if (px == null || !(px > 0) || cost == null) return null;
+    return pos.amount * px - cost;
+  }
+
+  function hasOpenPosOnLive() {
+    if (!live.chain || !live.address) return false;
+    for (const pos of Object.values(state.positions || {})) {
+      if (isLiveTokenPos(pos) && pos.amount > 0) return true;
+    }
+    return false;
+  }
+
+  /** Any positive live price on a token page is enough to trade — no age / source gate */
+  function isTradeReady() {
+    return !!(live.chain && live.address && live.price != null && live.price > 0);
+  }
+
+  function isMeaningfulMove(prev, next) {
+    if (!(next > 0)) return false;
+    if (prev == null || !(prev > 0)) return true;
+    return Math.abs(next - prev) / prev >= MIN_PAGE_MOVE || Math.abs(next - prev) > 0;
+  }
+
+  /**
+   * Mark = GMGN page family only (locked DOM + page fetch/WS JSON).
+   * Dex only cold-starts if page silent >2.5s — never fights page (no large-gap flicker).
+   */
   function applyLiveQuote(found, source) {
     if (!found || found.price == null || !(found.price > 0)) return false;
+
+    const fromPage = PAGE_SOURCES.has(source);
+    const fromDex = source === 'dex';
+    if (!fromPage && !fromDex) return false;
+
+    if (fromDex) {
+      // Fallback only when page mark missing/stale
+      if (live.price != null && live.markFrom === 'page' && quoteAgeMs() < 2500) return false;
+      if (live.price != null && quoteAgeMs() < 2500) return false;
+    }
+
+    if (fromPage && routeGraceActive() && source === 'dom') return false;
+
     const route = parseRoute(location.pathname);
     const want = route.address || live.address;
-
-    // Never attach a quote from another token
     if (want && found.address && !addrEquals(found.address, want)) return false;
 
-    // Trusted API/Dex must carry a matching address when we know the token
-    if (want && isTrustedSource(source) && !found.address) return false;
-
-    // DOM during SPA transition often still shows the previous token
-    if (source === 'dom' && want && routeGraceActive()) {
-      if (found.symbol && (!live.symbol || live.symbol === '—')) live.symbol = found.symbol;
+    const next = found.price;
+    if (fromPage && live.price != null && live.markFrom === 'page') {
+      // Same locked node: accept all changes. Reject only absurd 1000x glitches.
+      const ratio = next / live.price;
+      if (ratio > 1000 || ratio < 1 / 1000) return false;
+    } else if (!isMeaningfulMove(live.price, next) && live.price != null) {
       return false;
     }
 
-    // DOM without verified address: display-only gap fill after grace; never overwrite trusted
-    if (want && !found.address) {
-      if (source !== 'dom') return false;
-      if (live.price != null && isTrustedSource(live.source)) return false;
-      if (routeGraceActive()) return false;
-    }
-
-    // Reject absurd DOM jumps (often mis-bound mcap / wrong node)
-    if (source === 'dom' && live.price != null && live.price > 0) {
-      const ratio = found.price / live.price;
-      if (ratio > DOM_MAX_JUMP || ratio < 1 / DOM_MAX_JUMP) return false;
-    }
-
-    // If labeled "price" looks like a market-cap scale vs known mcap, reject
-    if (found.mcap != null && found.mcap > 0 && found.price > 0) {
-      if (found.price > found.mcap * 0.5 && found.mcap > 1000) return false;
-    }
-
-    const incoming = SOURCE_RANK[source] || 0;
-    const current = SOURCE_RANK[live.source] || 0;
-    // Lower-ranked source cannot overwrite a higher-ranked quote unless empty
-    if (live.price != null && incoming < current) {
-      if (live.mcap == null && found.mcap != null && found.mcap > 0 && incoming >= 1) {
-        live.mcap = found.mcap;
-        scheduleRender();
-      }
-      return false;
-    }
-
-    // Same or higher rank: still reject stale DOM overwriting a fresh trusted quote of equal... DOM is always lower
-    live.price = found.price;
+    live.price = next;
     if (found.mcap != null && found.mcap > 0) live.mcap = found.mcap;
     if (found.symbol) live.symbol = found.symbol;
     if (found.address && !live.address) live.address = found.address;
-    live.source = source || live.source || '';
+    else if (!live.address && want) live.address = want;
+    live.source = fromPage ? 'page' : 'dex';
+    live.markFrom = fromPage ? 'page' : 'dex';
     live.updatedAt = Date.now();
-    rememberMarkPrice(found.price);
+    rememberMarkPrice(live.price);
     checkLimitOrders();
-    scheduleRender();
+    paintLiveNow(true);
     return true;
+  }
+
+  function paintLiveNow(force) {
+    const now = Date.now();
+    if (!force && now - lastPaintAt < PAINT_MIN_MS) {
+      if (paintQueued) return;
+      paintQueued = true;
+      setTimeout(() => {
+        paintQueued = false;
+        paintLiveNow(true);
+      }, PAINT_MIN_MS - (now - lastPaintAt));
+      return;
+    }
+    lastPaintAt = now;
+    try {
+      const body = document.querySelector(`#${PANEL_ID} .gpt-body`);
+      if (body && body.querySelector('[data-live="price"]')) {
+        const route = parseRoute(location.pathname);
+        if (route.chain) live.chain = route.chain;
+        if (route.address) live.address = route.address;
+        patchLiveNumbers(body);
+        return;
+      }
+      scheduleRender(true);
+    } catch (err) {
+      console.error('[GMGN Paper Trade] paintLiveNow', err);
+    }
   }
 
   function ingestJsonPayload(data) {
     try {
       const route = parseRoute(location.pathname);
       const want = route.address || live.address;
-      // Require address match — never promote anonymous first-price hits to gmgn-api
-      if (!want) return;
+      if (!want || !data) return;
       const found = deepFindPrice(data, 0, want);
-      if (!found || !found.address || !addrEquals(found.address, want)) return;
-      applyLiveQuote(found, 'gmgn-api');
-    } catch (_) {
-      /* ignore */
+      if (found) applyLiveQuote(found, 'page-json');
+    } catch (err) {
+      console.warn('[GMGN Paper Trade] ingestJson', err);
     }
   }
 
@@ -589,58 +669,17 @@
     return deepFindPrice(data, 0, address);
   }
 
-  function fetchGmgnTokenInfo(force) {
-    const route = parseRoute(location.pathname);
-    const address = route.address || live.address;
-    const chain = route.chain || live.chain;
-    if (!address || !chain) return;
-    const now = Date.now();
-    if (!force && (gmgnFetching || now - lastGmgnFetchAt < 900)) return;
-    lastGmgnFetchAt = now;
-    gmgnFetching = true;
-
-    // Ask page context to fetch (has cookies / same-origin) — more reliable than extension sandbox
-    try {
-      window.postMessage(
-        {
-          source: 'gmgn-paper-trade-req',
-          type: 'fetch-token-info',
-          chain,
-          address,
-        },
-        '*'
-      );
-    } catch (_) {
-      /* ignore */
-    }
-
-    // Also try directly (works for extension host_permissions / some TM setups)
-    fetch('https://gmgn.ai/api/v1/mutil_window_token_info', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ addresses: [address], chain }),
-    })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('status ' + r.status))))
-      .then((data) => {
-        gmgnFetching = false;
-        const found = parseGmgnTokenInfoPayload(data, address);
-        if (found) applyLiveQuote(found, 'gmgn-api');
-      })
-      .catch(() => {
-        gmgnFetching = false;
-      });
-  }
+  function fetchGmgnTokenInfo(_force) {}
 
   function fetchDexScreenerQuote(force) {
     const route = parseRoute(location.pathname);
     const address = route.address || live.address;
     if (!address) return;
+    // Skip Dex while page mark is live
+    if (!force && live.markFrom === 'page' && live.price != null && quoteAgeMs() < 2500) return;
     const now = Date.now();
-    if (!force && (dexFetching || now - lastDexFetchAt < 1200)) return;
+    const minGap = 800;
+    if (!force && (dexFetching || now - lastDexFetchAt < minGap)) return;
     lastDexFetchAt = now;
     dexFetching = true;
     const url = 'https://api.dexscreener.com/latest/dex/tokens/' + encodeURIComponent(address);
@@ -671,8 +710,9 @@
           'dex'
         );
       })
-      .catch(() => {
+      .catch((err) => {
         dexFetching = false;
+        console.warn('[GMGN Paper Trade] dex fetch failed', err && err.message ? err.message : err);
       });
   }
 
@@ -749,156 +789,102 @@
     return null;
   }
 
-  function scrapeDomPrice() {
-    const route = parseRoute(location.pathname);
-    if (route.chain) live.chain = route.chain;
-    if (route.address) live.address = route.address;
+  function scrapePagePrice() {
+    if (!document.body || routeGraceActive()) return null;
+    const labeled = findLabeledValue(['价格', 'Price', 'price', '单价'], { max: 1e6 });
+    if (labeled != null) return labeled;
 
     const h1 = document.querySelector('h1');
+    const scopes = [];
     if (h1) {
-      const t = h1.textContent.trim().split(/\s+/)[0];
-      if (t && t.length <= 24 && !/^\$?\d/.test(t)) live.symbol = t.replace(/^\$/, '');
+      scopes.push(h1.parentElement, h1.parentElement && h1.parentElement.parentElement);
     }
-    if ((!live.symbol || live.symbol === '—') && document.title) {
-      const tm = document.title.match(/^\$?([A-Za-z0-9._]{1,20})/);
-      if (tm) live.symbol = tm[1];
-    }
-
-    // DOM is lowest priority — never stamp route address onto scraped numbers
-    // (that caused previous-token price bleed on SPA navigations).
-    const labeledPrice = findLabeledValue(['价格', 'Price', 'price', '单价'], { max: 1e6 });
-    const labeledMcap = findLabeledValue(['市值', 'Market Cap', 'MarketCap', 'Mkt Cap', 'MC']);
-
-    if (labeledPrice != null || labeledMcap != null) {
-      applyLiveQuote(
-        {
-          price: labeledPrice,
-          mcap: labeledMcap,
-          symbol: live.symbol !== '—' ? live.symbol : null,
-          address: null,
-        },
-        'dom'
-      );
-    } else if (live.price == null && !routeGraceActive() && document.body) {
-      // Only when completely empty and past SPA grace: look for tiny prices near header
-      const header = document.querySelector('h1') && document.querySelector('h1').parentElement;
-      const scope = header || document.body;
-      const nodes = scope.querySelectorAll('span, div, b, strong');
-      for (let i = 0; i < nodes.length && i < 200; i++) {
-        const txt = (nodes[i].textContent || '').trim();
+    // Common GMGN header band
+    const main = document.querySelector('main') || document.body;
+    scopes.push(main);
+    const seen = new Set();
+    for (const scope of scopes) {
+      if (!scope || seen.has(scope)) continue;
+      seen.add(scope);
+      const nodes = scope.querySelectorAll('span, div, b, strong, p');
+      const limit = scope === main ? 400 : 300;
+      for (let i = 0; i < nodes.length && i < limit; i++) {
+        const el = nodes[i];
+        const txt = (el.textContent || '').trim();
         if (!txt || txt.length > 28) continue;
-        if (!/^\$/.test(txt) && !/^0\.0[₀₁₂₃₄₅₆₇₈₉]/.test(txt)) continue;
+        if ((el.childElementCount || 0) > 2) continue;
+        if (!/^\$/.test(txt) && !/^0\.0[₀₁₂₃₄₅₆₇₈₉]/.test(txt) && !/^0\.0+\d/.test(txt)) continue;
         const n = parseMoney(txt);
-        if (n != null && n > 0 && n < 100) {
-          applyLiveQuote({ price: n, mcap: null, address: null }, 'dom');
-          break;
-        }
+        // Token unit prices are usually tiny; reject obvious mcaps
+        if (n != null && n > 0 && n < 100000) return n;
       }
     }
+    return null;
+  }
 
-    if (route.address) {
-      fetchGmgnTokenInfo(false);
-      fetchDexScreenerQuote(false);
+  function scrapeDomPrice() {
+    try {
+      const route = parseRoute(location.pathname);
+      if (route.chain) live.chain = route.chain;
+      if (route.address) live.address = route.address;
+
+      const rk = location.pathname + location.search;
+      if (rk !== lastRoute) {
+        onRouteMaybeChanged();
+        return;
+      }
+
+      const h1 = document.querySelector('h1');
+      if (h1) {
+        const t = h1.textContent.trim().split(/\s+/)[0];
+        if (t && t.length <= 24 && !/^\$?\d/.test(t)) live.symbol = t.replace(/^\$/, '');
+      }
+      if ((!live.symbol || live.symbol === '—') && document.title) {
+        const tm = document.title.match(/^\$?([A-Za-z0-9._]{1,20})/);
+        if (tm) live.symbol = tm[1];
+      }
+
+      // Ask MAIN hook for a tick; Dex only if page silent
+      try {
+        window.postMessage({ source: 'gmgn-paper-trade-req', type: 'ping-tick' }, '*');
+      } catch (_) {}
+      if (route.address && (live.price == null || live.markFrom !== 'page' || quoteAgeMs() > 2500)) {
+        fetchDexScreenerQuote(false);
+      }
+      refreshHeldQuotes(false);
+      if (currentPosition()) paintLiveNow(false);
+    } catch (err) {
+      console.error('[GMGN Paper Trade] scrapeDomPrice', err);
     }
-    refreshHeldQuotes(false);
-    scheduleRender();
   }
 
   function installPageHooks() {
     window.addEventListener('message', (ev) => {
-      if (!ev || !ev.data) return;
-      if (ev.data.source === 'gmgn-paper-trade' && ev.data.type === 'price-json') {
-        ingestJsonPayload(ev.data.payload);
-      }
-      if (ev.data.source === 'gmgn-paper-trade' && ev.data.type === 'token-info') {
-        gmgnFetching = false;
-        const found = parseGmgnTokenInfoPayload(ev.data.payload, ev.data.address || live.address);
-        if (found) applyLiveQuote(found, 'gmgn-api');
+      try {
+        if (!ev || !ev.data || ev.data.source !== 'gmgn-paper-trade') return;
+        if (ev.data.type === 'dom-tick') {
+          const px = Number(ev.data.price);
+          if (!(px > 0)) return;
+          const route = parseRoute(location.pathname);
+          applyLiveQuote(
+            {
+              price: px,
+              address: route.address || live.address || null,
+              symbol: live.symbol !== '—' ? live.symbol : null,
+            },
+            'dom-tick'
+          );
+        } else if (ev.data.type === 'price-json') {
+          ingestJsonPayload(ev.data.payload);
+        } else if (ev.data.type === 'token-info') {
+          gmgnFetching = false;
+          const found = parseGmgnTokenInfoPayload(ev.data.payload, ev.data.address || live.address);
+          if (found) applyLiveQuote(found, 'gmgn-api');
+        }
+      } catch (err) {
+        console.warn('[GMGN Paper Trade] message hook', err);
       }
     });
-
-    const injected = `
-      (function () {
-        if (window.__gmgnPaperPageHooked) return;
-        window.__gmgnPaperPageHooked = true;
-        function emit(payload) {
-          try {
-            window.postMessage({ source: 'gmgn-paper-trade', type: 'price-json', payload: payload }, '*');
-          } catch (e) {}
-        }
-        function maybeParse(text, url) {
-          try {
-            if (!text || typeof text !== 'string') return;
-            if (!/gmgn|token|price|pair|pool|trade|candle|kline|stat|mutil_window|dexscreener/i.test(String(url || text.slice(0, 120)))) return;
-            var t = text.trim();
-            if (t[0] !== '{' && t[0] !== '[') return;
-            emit(JSON.parse(t));
-          } catch (e) {}
-        }
-        window.addEventListener('message', function (ev) {
-          var d = ev && ev.data;
-          if (!d || d.source !== 'gmgn-paper-trade-req' || d.type !== 'fetch-token-info') return;
-          try {
-            fetch('https://gmgn.ai/api/v1/mutil_window_token_info', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-              body: JSON.stringify({ addresses: [d.address], chain: d.chain })
-            }).then(function (res) { return res.json(); }).then(function (json) {
-              window.postMessage({ source: 'gmgn-paper-trade', type: 'token-info', payload: json, address: d.address }, '*');
-            }).catch(function () {});
-          } catch (e) {}
-        });
-        var ofetch = window.fetch;
-        if (typeof ofetch === 'function') {
-          window.fetch = function () {
-            var args = arguments;
-            var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
-            return ofetch.apply(this, args).then(function (res) {
-              try {
-                res.clone().text().then(function (t) { maybeParse(t, url); }).catch(function () {});
-              } catch (e) {}
-              return res;
-            });
-          };
-        }
-        var XO = XMLHttpRequest.prototype.open;
-        var XS = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (method, url) {
-          this.__gptUrl = url;
-          return XO.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function () {
-          this.addEventListener('load', function () {
-            try { maybeParse(this.responseText, this.__gptUrl); } catch (e) {}
-          });
-          return XS.apply(this, arguments);
-        };
-      })();
-    `;
-
-    try {
-      const s = document.createElement('script');
-      s.textContent = injected;
-      (document.head || document.documentElement).appendChild(s);
-      s.remove();
-    } catch (err) {
-      try {
-        const w = window;
-        const ofetch = w.fetch;
-        if (ofetch && !w.__gmgnPaperFetchHooked) {
-          w.__gmgnPaperFetchHooked = true;
-          w.fetch = function (...args) {
-            return ofetch.apply(this, args).then((res) => {
-              res.clone().json().then((d) => ingestJsonPayload(d)).catch(() => {});
-              return res;
-            });
-          };
-        }
-      } catch (e2) {
-        LOG('network hook failed', e2);
-      }
-    }
   }
 
   function installSpaHooks() {
@@ -934,18 +920,22 @@
     live.mcap = null;
     live.symbol = '—';
     live.source = '';
+    live.markFrom = '';
     live.updatedAt = 0;
     live.routeGen = (live.routeGen || 0) + 1;
     routeChangedAt = Date.now();
     lastDexFetchAt = 0;
     lastGmgnFetchAt = 0;
     LOG('route', route);
-    // Prefer trusted APIs immediately; DOM scrape waits for grace inside applyLiveQuote
+    try {
+      window.postMessage({ source: 'gmgn-paper-trade-req', type: 'reset-lock' }, '*');
+    } catch (_) {}
     if (route.address) {
-      fetchGmgnTokenInfo(true);
+      scrapeDomPrice();
       fetchDexScreenerQuote(true);
+    } else {
+      scrapeDomPrice();
     }
-    scrapeDomPrice();
     scheduleRender(true);
   }
 
@@ -963,7 +953,10 @@
   }
 
   function isCurrentPos(key) {
-    return live.chain && live.address && key === posKey(live.chain, live.address);
+    if (!live.chain || !live.address) return false;
+    if (key === posKey(live.chain, live.address)) return true;
+    const pos = state.positions[key];
+    return isLiveTokenPos(pos);
   }
 
   function calcEquity() {
@@ -972,7 +965,12 @@
 
   function currentPosition() {
     if (!live.chain || !live.address) return null;
-    return state.positions[posKey(live.chain, live.address)] || null;
+    const direct = state.positions[posKey(live.chain, live.address)];
+    if (direct && direct.amount > 0) return direct;
+    for (const pos of Object.values(state.positions || {})) {
+      if (isLiveTokenPos(pos) && pos.amount > 0) return pos;
+    }
+    return null;
   }
 
   function applySlippage(price, side) {
@@ -986,24 +984,10 @@
     return (notional * bps) / 10000;
   }
 
-  /** Refuse trade on stale/DOM/unverified quotes — root cause of fake multi-x P&L */
+  /** Instant trade: only need a positive live price on the token page */
   function assertTradeableQuote() {
     if (!live.chain || !live.address) return { ok: false, error: '请打开 token 详情页' };
-    if (live.price == null || live.price <= 0) {
-      fetchGmgnTokenInfo(true);
-      fetchDexScreenerQuote(true);
-      return { ok: false, error: '暂无有效价格，稍候再试' };
-    }
-    if (!isTrustedSource(live.source)) {
-      fetchGmgnTokenInfo(true);
-      fetchDexScreenerQuote(true);
-      return { ok: false, error: '报价未就绪（需 GMGN/Dex），请稍候' };
-    }
-    if (quoteAgeMs() > QUOTE_MAX_AGE_MS) {
-      fetchGmgnTokenInfo(true);
-      fetchDexScreenerQuote(true);
-      return { ok: false, error: '报价过期，正在刷新…' };
-    }
+    if (live.price == null || live.price <= 0) return { ok: false, error: '暂无价格' };
     return { ok: true };
   }
 
@@ -1022,21 +1006,30 @@
     if (net <= 0) return { ok: false, error: '金额过小' };
     const tokenAmount = net / execPrice;
     const key = posKey(live.chain, live.address);
-    const prev = state.positions[key];
+    const prev = state.positions[key] || currentPosition();
     if (prev) {
-      const newAmt = prev.amount + tokenAmount;
-      prev.avgCostUsdt = (prev.amount * prev.avgCostUsdt + net) / newAmt;
-      prev.amount = newAmt;
+      ensurePosCost(prev);
+      const prevKey = posKey(prev.chain, prev.address);
+      prev.costUsdt = (prev.costUsdt || 0) + amountIn;
+      prev.amount += tokenAmount;
+      prev.avgCostUsdt = prev.costUsdt / prev.amount;
       prev.symbol = live.symbol || prev.symbol;
       prev.lastPrice = midPrice;
       prev.lastPriceAt = Date.now();
+      if (prevKey !== key) {
+        delete state.positions[prevKey];
+        state.positions[key] = prev;
+        prev.chain = live.chain;
+        prev.address = live.address;
+      }
     } else {
       state.positions[key] = {
         chain: live.chain,
         address: live.address,
         symbol: live.symbol || shortAddr(live.address),
         amount: tokenAmount,
-        avgCostUsdt: execPrice,
+        costUsdt: amountIn,
+        avgCostUsdt: amountIn / tokenAmount,
         lastPrice: midPrice,
         lastPriceAt: Date.now(),
         openedAt: Date.now(),
@@ -1057,6 +1050,12 @@
       quoteSource: live.source,
     });
     saveState();
+    // Background refresh only — never block the fill
+    setTimeout(() => {
+      try {
+        fetchDexScreenerQuote(true);
+      } catch (_) {}
+    }, 0);
     return { ok: true, execPrice, midPrice };
   }
 
@@ -1081,8 +1080,12 @@
     }
 
     const key = posKey(chain, address);
-    const pos = state.positions[key];
+    let pos = state.positions[key];
+    if (!pos || pos.amount <= 0) {
+      pos = currentPosition();
+    }
     if (!pos || pos.amount <= 0) return { ok: false, error: '无持仓' };
+    ensurePosCost(pos);
 
     const sellAmt = Math.min(amount, pos.amount);
     const midPrice = live.price;
@@ -1090,11 +1093,17 @@
     const gross = sellAmt * execPrice;
     const fee = applyFee(gross);
     const proceeds = gross - fee;
-    const realized = proceeds - sellAmt * pos.avgCostUsdt;
+    const costSlice = (pos.costUsdt || pos.amount * pos.avgCostUsdt) * (sellAmt / pos.amount);
+    const realized = proceeds - costSlice;
 
     pos.amount -= sellAmt;
-    if (pos.amount <= 1e-12) delete state.positions[key];
-    else {
+    pos.costUsdt = Math.max(0, (pos.costUsdt || 0) - costSlice);
+    if (pos.amount <= 1e-12) {
+      const posKeyNow = posKey(pos.chain, pos.address);
+      delete state.positions[posKeyNow];
+      if (state.positions[key]) delete state.positions[key];
+    } else {
+      pos.avgCostUsdt = pos.costUsdt / pos.amount;
       pos.lastPrice = midPrice;
       pos.lastPriceAt = Date.now();
     }
@@ -1116,6 +1125,11 @@
       quoteSource: live.source,
     });
     saveState();
+    setTimeout(() => {
+      try {
+        fetchDexScreenerQuote(true);
+      } catch (_) {}
+    }, 0);
     return { ok: true, realized, sold: sellAmt, execPrice };
   }
 
@@ -1587,9 +1601,12 @@
       const res = buy(input ? Number(input.value) : 0);
       msg(
         res.ok
-          ? `买入成功 @ $${fmt(res.execPrice, 8)}（中间价 $${fmt(res.midPrice, 8)}）`
+          ? `买入成功 @ $${fmt(res.execPrice, 8)}`
           : res.error
       );
+      // Instant UI: patch numbers now, rebuild list next frame
+      const body = document.querySelector(`#${PANEL_ID} .gpt-body`);
+      if (body && res.ok) patchLiveNumbers(body);
       scheduleRender(true);
       return;
     }
@@ -1597,6 +1614,8 @@
       const pct = Number(actEl.getAttribute('data-pct'));
       const res = sell(pct);
       msg(res.ok ? `卖出成功 已实现 ${res.realized >= 0 ? '+' : ''}${fmt(res.realized)}` : res.error);
+      const body = document.querySelector(`#${PANEL_ID} .gpt-body`);
+      if (body && res.ok) patchLiveNumbers(body);
       scheduleRender(true);
       return;
     }
@@ -1654,20 +1673,19 @@
     const equity = calcEquity();
     const dayPnl = equity - (state.dayStartEquity || equity);
     const pos = currentPosition();
-    const markPx = pos ? markPriceForPos(posKey(live.chain, live.address), pos) : null;
+    const posKeyNow = pos ? posKey(pos.chain, pos.address) : null;
+    const markPx = pos ? markPriceForPos(posKeyNow, pos) : null;
     const posValue = pos && markPx != null ? pos.amount * markPx : null;
-    const posCost = pos ? pos.amount * pos.avgCostUsdt : null;
-    const upnl = posValue != null && posCost != null ? posValue - posCost : null;
-    const upnlPct = posCost ? upnl / posCost : null;
-    const quoteOk = isTrustedSource(live.source) && live.price != null && quoteAgeMs() <= QUOTE_MAX_AGE_MS;
+    const posCost = pos ? posCostUsdt(pos) : null;
+    const upnl = posUnrealizedPnl(posKeyNow, pos);
+    const upnlPct = posCost && upnl != null ? upnl / posCost : null;
+    const quoteOk = isTradeReady();
 
     const set = (key, text, cls) => {
       const el = body.querySelector(`[data-live="${key}"]`);
       if (!el) return;
-      el.textContent = text;
-      if (cls !== undefined) {
-        el.className = cls;
-      }
+      if (el.textContent !== text) el.textContent = text;
+      if (cls !== undefined && el.className !== cls) el.className = cls;
     };
 
     set('cash', fmt(state.cashUsdt));
@@ -1677,21 +1695,44 @@
     set('price', live.price != null ? '$' + fmt(live.price, 8) : '读取中…');
     set('mcap', live.mcap != null ? '$' + fmt(live.mcap) : '—');
     set('posAmt', pos ? fmt(pos.amount, 4) : '0');
+    set('posVal', posValue != null ? fmt(posValue) : '—');
     set('avgCost', pos ? '$' + fmt(pos.avgCostUsdt, 8) : '—');
     set('upnl', upnl == null ? '—' : (upnl >= 0 ? '+' : '') + fmt(upnl), 'gpt-live ' + pnlClass(upnl));
     set('upnlPct', upnlPct == null ? '—' : fmtPct(upnlPct), 'gpt-pnl-pct ' + pnlClass(upnlPct));
-    const srcMap = { 'gmgn-api': 'GMGN', dex: 'Dex', dom: '页面' };
-    const age = live.updatedAt ? Math.round(quoteAgeMs() / 100) / 10 + 's' : '—';
-    const ready = quoteOk ? '可交易' : '等待可靠报价';
     set(
       'src',
-      live.source
-        ? `报价源: ${srcMap[live.source] || live.source} · ${age} · ${ready}`
-        : '报价源: …'
+      live.price != null ? '实时跟价 · 页面' : '正在读取页面现价…'
     );
 
     const openN = (state.orders || []).filter((o) => o.status === 'open').length;
     set('openOrders', String(openN));
+
+    // Keep open position rows mark-to-market without full re-render
+    body.querySelectorAll('[data-pos-key]').forEach((row) => {
+      const key = row.getAttribute('data-pos-key');
+      const p = state.positions[key];
+      if (!p) return;
+      const px = markPriceForPos(key, p);
+      const val = px != null ? p.amount * px : null;
+      const cost = posCostUsdt(p);
+      const pnl = val != null && cost != null ? val - cost : null;
+      const pct = cost && pnl != null ? pnl / cost : null;
+      const valEl = row.querySelector('[data-pos-val]');
+      const metaEl = row.querySelector('[data-pos-meta]');
+      if (valEl) {
+        const html =
+          (val == null ? '—' : fmt(val)) +
+          (pct == null ? '' : ' <span class="gpt-pnl-pct">' + fmtPct(pct) + '</span>');
+        const cls = pnlClass(pnl);
+        if (valEl.className !== cls) valEl.className = cls;
+        if (valEl.innerHTML !== html) valEl.innerHTML = html;
+      }
+      if (metaEl) {
+        const meta =
+          fmt(p.amount, 4) + ' tok · 成本 $' + fmt(p.avgCostUsdt, 8) + (px ? ' · 现价 $' + fmt(px, 8) : '');
+        if (metaEl.textContent !== meta) metaEl.textContent = meta;
+      }
+    });
 
     // Keep trade controls in sync without full re-render
     body.querySelectorAll('[data-act="buy"]').forEach((el) => {
@@ -1704,30 +1745,31 @@
       el.disabled = !(quoteOk && pos);
     });
     const msgEl = body.querySelector('.gpt-msg');
-    if (msgEl && !quoteOk) {
-      if (!msgEl.textContent || msgEl.textContent.indexOf('等待') === 0 || msgEl.textContent === '') {
-        msgEl.textContent = '等待 GMGN/Dex 可靠报价后再交易…';
-      }
-    } else if (msgEl && quoteOk && msgEl.textContent.indexOf('等待 GMGN/Dex') === 0) {
+    if (msgEl && quoteOk && (msgEl.textContent.indexOf('等待') === 0 || msgEl.textContent.indexOf('正在读取') === 0)) {
       msgEl.textContent = '';
+    } else if (msgEl && !quoteOk && !msgEl.textContent) {
+      msgEl.textContent = '正在读取页面现价…';
     }
   }
 
   function scheduleRender(forceFull) {
+    if (forceFull) renderForceFull = true;
     if (renderQueued) return;
     renderQueued = true;
     requestAnimationFrame(() => {
       renderQueued = false;
+      const full = renderForceFull;
+      renderForceFull = false;
       try {
         const body = document.querySelector(`#${PANEL_ID} .gpt-body`);
-        if (!forceFull && body && body.querySelector('[data-live="price"]')) {
+        if (!full && body && body.querySelector('[data-live="price"]')) {
           const route = parseRoute(location.pathname);
           if (route.chain) live.chain = route.chain;
           if (route.address) live.address = route.address;
           patchLiveNumbers(body);
           return;
         }
-        renderPanel(!!forceFull);
+        renderPanel(!!full);
       } catch (err) {
         console.error('[GMGN Paper Trade] render error', err);
         showBeacon('GMGN 渲染出错: ' + (err && err.message ? err.message : err));
@@ -1773,32 +1815,34 @@
     const equity = calcEquity();
     const dayPnl = equity - (state.dayStartEquity || equity);
     const pos = currentPosition();
-    const markPx = pos ? markPriceForPos(posKey(live.chain, live.address), pos) : null;
+    const posKeyNow = pos ? posKey(pos.chain, pos.address) : null;
+    const markPx = pos ? markPriceForPos(posKeyNow, pos) : null;
     const posValue = pos && markPx != null ? pos.amount * markPx : null;
-    const posCost = pos ? pos.amount * pos.avgCostUsdt : null;
-    const upnl = posValue != null && posCost != null ? posValue - posCost : null;
-    const upnlPct = posCost ? upnl / posCost : null;
-    const quoteOk = isTrustedSource(live.source) && live.price != null && quoteAgeMs() <= QUOTE_MAX_AGE_MS;
+    const posCost = pos ? posCostUsdt(pos) : null;
+    const upnl = posUnrealizedPnl(posKeyNow, pos);
+    const upnlPct = posCost && upnl != null ? upnl / posCost : null;
+    const quoteOk = isTradeReady();
 
     const buyPcts = normalizePctList(state.settings.buyPcts);
     const sellPcts = normalizePctList(state.settings.sellPcts);
 
     const posRows = Object.entries(state.positions)
       .map(([key, p]) => {
+        ensurePosCost(p);
         const px = markPriceForPos(key, p);
-        const val = px != null ? p.amount * px : p.amount * p.avgCostUsdt;
-        const cost = p.amount * p.avgCostUsdt;
-        const pnl = val - cost;
-        const pct = cost ? pnl / cost : null;
+        const val = px != null ? p.amount * px : null;
+        const cost = posCostUsdt(p);
+        const pnl = val != null && cost != null ? val - cost : null;
+        const pct = cost && pnl != null ? pnl / cost : null;
         const stale = !isCurrentPos(key) && (!p.lastPriceAt || Date.now() - p.lastPriceAt > 60000);
         return `<div class="gpt-item" data-pos-key="${escapeAttr(key)}">
           <div>
             <div><strong>${escapeHtml(p.symbol)}</strong> <span class="gpt-chain">${escapeHtml(p.chain)}</span></div>
-            <div class="gpt-muted">${shortAddr(p.address)}${stale ? ' · 价待刷新' : ''}</div>
+            <div class="gpt-muted" data-pos-meta>${fmt(p.amount, 4)} tok · 成本 $${fmt(p.avgCostUsdt, 8)}${px ? ' · 现价 $' + fmt(px, 8) : ''}${stale ? ' · 价待刷新' : ''}</div>
           </div>
           <div style="text-align:right">
-            <div class="${pnlClass(pnl)}">${fmt(val)} <span class="gpt-pnl-pct">${pct == null ? '' : fmtPct(pct)}</span></div>
-            <div class="gpt-muted">${fmt(p.amount, 4)} tok · 成本 $${fmt(p.avgCostUsdt, 8)}</div>
+            <div data-pos-val class="${pnlClass(pnl)}">${val == null ? '—' : fmt(val)} <span class="gpt-pnl-pct">${pct == null ? '' : fmtPct(pct)}</span></div>
+            <div class="gpt-muted">${pnl == null ? '—' : (pnl >= 0 ? '+' : '') + fmt(pnl)} 浮盈</div>
           </div>
         </div>`;
       })
@@ -1854,12 +1898,7 @@
     const sec = state.ui.sections || { positions: false, trades: false, settings: false, limits: false };
     const chev = (open) => (open ? '▾' : '▸');
     const posCount = Object.keys(state.positions).length;
-    const srcMap = { 'gmgn-api': 'GMGN', dex: 'Dex', dom: '页面' };
-    const age = live.updatedAt ? Math.round(quoteAgeMs() / 100) / 10 + 's' : '—';
-    const ready = quoteOk ? '可交易' : '等待可靠报价';
-    const srcLabel = live.source
-      ? `${srcMap[live.source] || live.source} · ${age} · ${ready}`
-      : '…';
+    const srcLabel = live.price != null ? '实时跟价 · 页面' : '正在读取页面现价…';
     const tradeDisabled = onToken && !quoteOk ? 'disabled' : '';
     const defaultLimitPrice =
       fieldSnap.limitPrice ||
@@ -1887,10 +1926,11 @@
         <div class="gpt-row"><span class="gpt-muted">价格</span><span data-live="price">${live.price != null ? '$' + fmt(live.price, 8) : '读取中…'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">市值</span><span data-live="mcap">${live.mcap != null ? '$' + fmt(live.mcap) : '—'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">持仓</span><span data-live="posAmt">${pos ? fmt(pos.amount, 4) : '0'}</span></div>
+        <div class="gpt-row"><span class="gpt-muted">持仓市值</span><span data-live="posVal">${posValue != null ? fmt(posValue) : '—'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">成本价</span><span data-live="avgCost">${pos ? '$' + fmt(pos.avgCostUsdt, 8) : '—'}</span></div>
         <div class="gpt-row"><span class="gpt-muted">浮盈</span><span data-live="upnl" class="${pnlClass(upnl)}">${upnl == null ? '—' : (upnl >= 0 ? '+' : '') + fmt(upnl)}</span></div>
         <div class="gpt-row"><span class="gpt-muted">盈亏%</span><span data-live="upnlPct" class="gpt-pnl-pct ${pnlClass(upnlPct)}">${upnlPct == null ? '—' : fmtPct(upnlPct)}</span></div>
-        <div class="gpt-src" data-live="src">报价源: ${escapeHtml(srcLabel)}</div>
+        <div class="gpt-src" data-live="src">${escapeHtml(srcLabel)}</div>
       </div>
 
       ${
@@ -1915,7 +1955,7 @@
           </label>
         </div>
         <button type="button" class="gpt-btn gpt-sell" data-act="limit-sell" style="width:100%;margin-top:4px" ${pos && quoteOk ? '' : 'disabled'}>挂限价卖单</button>
-        <div class="gpt-msg">${quoteOk ? '' : '等待 GMGN/Dex 可靠报价后再交易…'}</div>
+        <div class="gpt-msg">${quoteOk ? '' : '正在读取页面现价…'}</div>
       </div>`
           : `<div class="gpt-card gpt-muted">打开 token 页可买卖 · Alt+P</div>`
       }
@@ -1963,7 +2003,7 @@
           <div class="gpt-msg-settings gpt-muted" style="margin-top:6px">快捷%用逗号分隔，如 10,25,50,100</div>
         </div>
       </div>
-      <div class="gpt-watermark">PAPER · Alt+P · v1.5.0</div>
+      <div class="gpt-watermark">PAPER · Alt+P · v1.7.6</div>
     `;
 
     restoreFields(body, fieldSnap);
@@ -2031,8 +2071,11 @@
 
     if (!window.__gptPriceTimer) {
       window.__gptPriceTimer = setInterval(() => {
-        scrapeDomPrice();
-        scheduleRender();
+        try {
+          scrapeDomPrice();
+        } catch (err) {
+          console.error('[GMGN Paper Trade] price timer', err);
+        }
       }, PRICE_POLL_MS);
     }
 

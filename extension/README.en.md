@@ -2,7 +2,7 @@
 
 Chrome / Edge extension for paper-trading memes on [GMGN](https://gmgn.ai) with virtual USDT. No wallet connection, no real on-chain transactions.
 
-**Version:** 1.5.0 · Manifest V3
+**Version:** 1.6.0 · Manifest V3
 
 [中文说明](./README.md)
 
@@ -14,8 +14,9 @@ Chrome / Edge extension for paper-trading memes on [GMGN](https://gmgn.ai) with 
 - Limit sell orders (auto-trigger when price ≥ target)
 - Positions, trade history, and open orders
 - Day P&amp;L and total equity
-- Price sources (by priority): GMGN API → DexScreener → page DOM; **trades only when GMGN/Dex quote is fresh**
-- Positions show cost basis and mark-to-market P&amp;L; off-page bags refresh via Dex
+- Price sources: live page / GMGN / Dex (~150ms); **trade as soon as a price is available**
+- After buy, price / unrealized P&amp;L / % track the page in near real-time
+- Positions show cost, mark value, and P&amp;L; off-page bags refresh via Dex
 - Draggable floating panel; `Alt+P` to show / hide
 
 ## Supported sites &amp; chains
@@ -38,17 +39,18 @@ Chains: Solana, BSC, Robinhood, Base, ETH, Monad, Tron, Blast, Arc, Stable, and 
 
 **Success indicators:**
 
-- Orange banner at the top: `GMGN 模拟交易 v1.5.0 已注入`
+- Orange banner at the top: `GMGN 模拟交易 v1.6.0 已注入`
 - Orange floating button at the bottom-right; click it or press `Alt+P` to open the panel
-- Console log: `[GMGN Paper Trade] script loaded ... v1.5.0`
+- Console log: `[GMGN Paper Trade] script loaded ... v1.6.0`
 
 ## Usage
 
-1. Go to a GMGN `/{chain}/token/...` page and wait for the price to load
-2. Enter a buy amount (USDT) or tap a quick %, then buy
-3. Sell with position-ratio shortcuts or place a limit sell
-4. In Settings, adjust slippage (bps), fee (bps), starting cash, and buy/sell quick %
-5. Click `↺` on the panel to reset the account (clears positions, orders, and trades)
+1. Go to a GMGN `/{chain}/token/...` page; when the panel shows **实时跟价** and a price, you can trade
+2. Enter a buy amount (USDT) or tap a quick %, then buy (instant fill, no waiting timer)
+3. After buy, price / unrealized P&L / % follow the live page price
+4. Sell with position-ratio shortcuts or place a limit sell
+5. In Settings, adjust slippage (bps), fee (bps), starting cash, and buy/sell quick %
+6. Click `↺` on the panel to reset the account (clears positions, orders, and trades)
 
 State is stored in page `localStorage` under `gmgn_paper_trade_v1`. Clearing site data will wipe the paper account.
 
@@ -57,7 +59,8 @@ State is stored in page `localStorage` under `gmgn_paper_trade_v1`. Clearing sit
 ```
 extension/
 ├── manifest.json   # MV3 manifest
-├── content.js      # Injected logic & UI
+├── page-hook.js    # MAIN world: intercept GMGN fetch/XHR quotes
+├── content.js      # Isolated world: panel UI & paper fills
 ├── README.md       # Chinese
 └── README.en.md    # English
 ```
